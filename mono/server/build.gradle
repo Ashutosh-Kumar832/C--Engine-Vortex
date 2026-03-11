@@ -24,7 +24,6 @@ dependencies {
 
     // Database
     implementation 'org.springframework.boot:spring-boot-starter-jdbc'
-    implementation 'org.springframework.boot:spring-boot-starter-data-redis'
     runtimeOnly 'org.postgresql:postgresql'
     implementation 'org.flywaydb:flyway-core'
 
@@ -64,7 +63,6 @@ dependencies {
     testImplementation libs.junit.jupiter
     testImplementation libs.mockito.core
     testRuntimeOnly libs.junit.platform.launcher
-    testImplementation 'com.github.codemonstur:embedded-redis:1.4.3'
 }
 
 test {

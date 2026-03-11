@@ -29,15 +29,6 @@
 namespace aipr {
 
 /**
- * Embedding provider types
- */
-enum class EmbedProvider {
-    HTTP,         // OpenAI-compatible HTTP API
-    LOCAL_ONNX,   // Local ONNX Runtime with all-MiniLM-L6-v2
-    CUSTOM        // Custom provider via config
-};
-
-/**
  * Engine configuration
  */
 struct AIPR_API EngineConfig {
@@ -57,17 +48,9 @@ struct AIPR_API EngineConfig {
     size_t graph_expand_depth = 2;
     
     // Embedding settings
-    EmbedProvider embed_provider = EmbedProvider::HTTP;
-    std::string embed_endpoint = "https://api.openai.com/v1/embeddings";
-    std::string embed_api_key_env = "OPENAI_API_KEY";
-    std::string embed_model = "text-embedding-3-small";
+    std::string embed_provider = "http";
+    std::string embed_endpoint;
     size_t embed_dimensions = 1536;
-    size_t embed_batch_size = 100;
-    size_t embed_timeout_seconds = 60;
-    
-    // Local ONNX model settings (when embed_provider == LOCAL_ONNX)
-    std::string onnx_model_path = "models/all-MiniLM-L6-v2.onnx";
-    std::string onnx_tokenizer_path = "models/tokenizer.json";
     
     // Load from YAML file
     static EngineConfig load(const std::string& config_path);

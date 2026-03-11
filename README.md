@@ -13,7 +13,7 @@
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED.svg)](https://hub.docker.com/)
 [![gRPC](https://img.shields.io/badge/gRPC-TLS-4285F4.svg)](https://grpc.io/)
 
-A platform-neutral PR review engine with connectors for GitHub, GitLab, Bitbucket, and Azure DevOps.
+A platform-neutral PR review engine with connectors for GitHub, GitLab, Bitbucket, and Jenkins.
 
 [Setup Guide](docs/setup.md) | [Architecture](docs/architecture.md)
 
@@ -23,14 +23,12 @@ A platform-neutral PR review engine with connectors for GitHub, GitLab, Bitbucke
 
 ## Features
 
-- **Platform Agnostic**: Works with GitHub, GitLab, Bitbucket, and Azure DevOps (cloud & self-hosted)
-- **CI/CD Integration**: GitHub Actions, GitLab CI, Jenkins, Bitbucket Pipelines, Azure Pipelines
+- **Platform Agnostic**: Works with GitHub, GitLab, and Bitbucket (cloud & self-hosted)
+- **CI/CD Integration**: GitHub Actions, GitLab CI, Jenkins, Bitbucket Pipelines
 - **High Performance**: C++ engine for code indexing and analysis via gRPC
-- **LLM Powered**: Supports OpenAI, Anthropic, Azure OpenAI, Ollama, and compatible APIs
-- **Multi-Cloud Storage**: Local, AWS S3, GCS, Azure Blob, OCI Object Storage, MinIO
+- **LLM Powered**: Supports OpenAI, Anthropic, and compatible APIs
 - **Self-Hostable**: Deploy on your infrastructure with full control
 - **TLS/mTLS Support**: Secure gRPC communication with included dev certificates
-- **Unified Configuration**: Single XML config (`rtserverprops.xml`) drives both Java and C++ components
 
 ## Prerequisites
 
@@ -61,93 +59,6 @@ cd /opt/aipr-*
 ./setup.sh                    # Configure environment
 nano config/rtserverprops.xml # Edit configuration
 ./run.sh                      # Start server
-```
-
-## Building the C++ Engine
-
-The C++ engine is an independent CMake project that can be built separately from the Java server.
-
-### Prerequisites (Linux / Ubuntu)
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-  build-essential cmake g++ \
-  libcurl4-openssl-dev \
-  libssl-dev \
-  libomp-dev \
-  libopenblas-dev \
-  liblapack-dev \
-  libgflags-dev
-```
-
-**FAISS** must be installed separately (not fetched by CMake):
-
-```bash
-git clone --depth 1 --branch v1.7.4 https://github.com/facebookresearch/faiss.git /tmp/faiss
-cd /tmp/faiss && mkdir build && cd build
-cmake .. \
-  -DFAISS_ENABLE_GPU=OFF \
-  -DFAISS_ENABLE_PYTHON=OFF \
-  -DFAISS_ENABLE_C_API=ON \
-  -DBUILD_TESTING=OFF \
-  -DBUILD_SHARED_LIBS=ON \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DBLA_VENDOR=OpenBLAS
-cmake --build . --config Release --parallel $(nproc)
-sudo cmake --install . --config Release
-sudo ldconfig
-```
-
-### Prerequisites (macOS)
-
-```bash
-brew install libomp openblas faiss protobuf grpc abseil
-```
-
-### Configure & Build
-
-From the repository root:
-
-```bash
-# Configure (fetches gRPC, abseil, nlohmann/json, tree-sitter, ONNX Runtime automatically)
-cmake -B build -S mono/engine \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DAIPR_BUILD_TESTS=ON \
-  -DAIPR_BUILD_SERVER=ON \
-  -DAIPR_USE_FAISS=ON \
-  -DAIPR_USE_TREE_SITTER=ON
-
-# Build (all targets)
-cmake --build build --parallel $(nproc)
-```
-
-### CMake Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `AIPR_BUILD_TESTS` | `ON` | Build unit tests (`aipr-engine-tests`) |
-| `AIPR_BUILD_SERVER` | `ON` | Build the gRPC server (`aipr-engine-server`) |
-| `AIPR_BUILD_TOOLS` | `ON` | Build utility tools |
-| `AIPR_USE_FAISS` | `ON` | Enable FAISS vector search |
-| `AIPR_USE_TREE_SITTER` | `ON` | Enable tree-sitter AST parsing |
-| `AIPR_USE_ONNX` | `ON` | Enable ONNX Runtime local embeddings |
-
-### Build Targets
-
-| Target | Description |
-|--------|-------------|
-| `aipr-engine` | Core static library |
-| `aipr-engine-server` | gRPC server executable |
-| `aipr-engine-doctor` | Diagnostics tool |
-| `aipr-engine-bench` | Benchmarking tool |
-| `aipr-engine-tests` | Unit test suite (Google Test) |
-| `tms-demo` | TMS demo application |
-
-### Running Tests
-
-```bash
-ctest --test-dir build --output-on-failure -C Release
 ```
 
 ## Repository Structure
@@ -201,35 +112,26 @@ aipr-<version>.zip
 
 ## Configuration
 
-All configuration is centralized in `config/rtserverprops.xml`. The Java server reads this file and pushes relevant settings (storage, LLM, etc.) to the C++ engine via gRPC at startup.
+Edit XML configuration files (no environment variables needed):
 
 **`config/rtserverprops.xml`** - Server settings:
 ```xml
-<!-- Database -->
-<database url="jdbc:postgresql://localhost:5432/aipr"
-          username="aipr" password="your_password"/>
-
-<!-- LLM Providers (multiple supported with failover) -->
-<llm primary="openai" fallback="ollama">
-    <openai api-key="${LLM_OPENAI_API_KEY}" model="gpt-4-turbo-preview"/>
-    <anthropic api-key="${LLM_ANTHROPIC_API_KEY}"/>
-    <azure-openai endpoint="${LLM_AZURE_OPENAI_ENDPOINT}" deployment="gpt-4"/>
-    <ollama base-url="http://localhost:11434"/>
-</llm>
-
-<!-- Storage (pushed to C++ engine via gRPC) -->
-<storage type="s3">
-    <s3 bucket="my-bucket" region="us-east-1"/>
-</storage>
+<database>
+    <host>localhost</host>
+    <port>5432</port>
+    <name>aipr</name>
+    <username>aipr</username>
+    <password>your_password</password>
+</database>
 ```
 
 **`config/vcsplatforms.xml`** - Platform OAuth:
 ```xml
-<github enabled="true" client-id="your_id" client-secret="your_secret"/>
-<azure-devops enabled="true" 
-              client-id="your_id" 
-              tenant-id="your_tenant"
-              webhook-secret="your_hmac_secret"/>
+<github>
+    <enabled>true</enabled>
+    <clientId>your_client_id</clientId>
+    <clientSecret>your_secret</clientSecret>
+</github>
 ```
 
 ## Platform Authentication
@@ -238,20 +140,6 @@ Configure which platforms to enable in `config/vcsplatforms.xml`, then authentic
 - `http://localhost:8080/api/v1/auth/github/login`
 - `http://localhost:8080/api/v1/auth/gitlab/login`
 - `http://localhost:8080/api/v1/auth/bitbucket/login`
-- `http://localhost:8080/api/v1/auth/azure-devops/login`
-
-## LLM Provider Management
-
-The server auto-discovers local Ollama instances and provides a REST API for provider management:
-
-```bash
-# List all providers with health status
-curl http://localhost:8080/api/v1/llm/providers
-
-# Switch active provider
-curl -X POST http://localhost:8080/api/v1/llm/providers/switch \
-  -d '{"provider": "ollama-local"}'
-```
 
 ## CI/CD Integration
 

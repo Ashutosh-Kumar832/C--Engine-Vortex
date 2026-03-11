@@ -33,7 +33,7 @@ public class UserSessionFactory {
     /**
      * Create a session for a platform OAuth token.
      *
-     * @param platform     The platform (GitHub, gitlab, bitbucket)
+     * @param platform     The platform (github, gitlab, bitbucket)
      * @param accessToken  The OAuth access token from the platform
      * @return A new user session
      */
@@ -44,7 +44,7 @@ public class UserSessionFactory {
     /**
      * Create a session with client information.
      *
-     * @param platform      The platform (GitHub, gitlab, bitbucket)
+     * @param platform      The platform (github, gitlab, bitbucket)
      * @param accessToken   The OAuth access token from the platform
      * @param clientType    The client type (sdk_java, sdk_python, cli, web)
      * @param clientVersion The client version
@@ -62,17 +62,17 @@ public class UserSessionFactory {
 
         // Create remote session wrapper using shared delegator
         IUserSessionRemote remote = new UserSessionRemote(
-            validatedSession.sessionId(),
-            validatedSession.grpcChannelId(),
+            validatedSession.getSessionId(),
+            validatedSession.getGrpcChannelId(),
             delegator
         );
 
         // Create and return the session
         return new UserSession(
-            validatedSession.sessionId(),
-            validatedSession.sessionId(), // session token
+            validatedSession.getSessionId(),
+            validatedSession.getSessionId(), // session token
             user,
-            validatedSession.expiresAt(),
+            validatedSession.getExpiresAt(),
             remote
         );
     }
@@ -90,24 +90,25 @@ public class UserSessionFactory {
         }
 
         // Create user info from validated session
-        UserInfo user = UserInfo.builder()
-            .id(validatedSession.userId())
-            .platform("unknown")
-            .username(validatedSession.username())
-            .build();
+        UserInfo user = new UserInfo(
+            validatedSession.getUserId(),
+            "unknown", // We could fetch this from DB
+            validatedSession.getUsername(),
+            null, null, null
+        );
 
         // Create remote session wrapper using shared delegator
         IUserSessionRemote remote = new UserSessionRemote(
             sessionToken,
-            validatedSession.grpcChannelId(),
+            validatedSession.getGrpcChannelId(),
             delegator
         );
 
         return new UserSession(
-            validatedSession.sessionId(),
+            validatedSession.getSessionId(),
             sessionToken,
             user,
-            validatedSession.expiresAt(),
+            validatedSession.getExpiresAt(),
             remote
         );
     }
@@ -125,12 +126,13 @@ public class UserSessionFactory {
         // 2. Create or update user in database
         // 3. Return UserInfo
 
-        return UserInfo.builder()
-            .id(java.util.UUID.randomUUID().toString())
-            .platform(platform)
-            .username("authenticated_user")
-            .email("user@example.com")
-            .displayName("Authenticated User")
-            .build();
+        return new UserInfo(
+            java.util.UUID.randomUUID().toString(),
+            platform,
+            "authenticated_user",
+            "user@example.com",
+            "Authenticated User",
+            null
+        );
     }
 }

@@ -33,9 +33,6 @@ compile_commands.json
 # Gradle
 .gradle/
 
-# Proto files copied by Gradle (source of truth is mono/proto/)
-mono/proto-java/src/main/proto/
-
 # IDE
 .idea/
 *.iml

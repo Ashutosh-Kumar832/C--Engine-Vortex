@@ -130,10 +130,7 @@ public class ReviewService {
                     .linesRemoved(diffAnalysis.totalDeletions())
                     .totalFindings(mergedComments.size())
                     .tokensUsed(llmResponse.tokensUsed())
-                    .promptTokens(llmResponse.promptTokens())
-                    .completionTokens(llmResponse.completionTokens())
-                    .latencyMs((int) latencyMs)
-                    .llmLatencyMs((int) llmResponse.latencyMs());
+                    .latencyMs((int) latencyMs);
 
             // Merge score-based metrics from LLM result if available
             if (reviewResult.metrics() != null) {
