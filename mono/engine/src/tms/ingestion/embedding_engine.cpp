@@ -273,9 +273,6 @@ public:
             case EmbeddingBackend::ONNX_RUNTIME:
                 initialized_ = initializeOnnx();
                 break;
-            case EmbeddingBackend::SENTENCE_TRANSFORMERS:
-                initialized_ = initializeSentenceTransformers();
-                break;
             case EmbeddingBackend::MOCK:
             default:
                 std::cerr << "[EMBED] Using MOCK embedding backend" << std::endl;
@@ -307,8 +304,6 @@ public:
                 return embedBatchHttp(texts);
             case EmbeddingBackend::ONNX_RUNTIME:
                 return embedBatchOnnx(texts);
-            case EmbeddingBackend::SENTENCE_TRANSFORMERS:
-                return embedBatchSentenceTransformers(texts);
             case EmbeddingBackend::MOCK:
             default:
                 return embedBatchMock(texts);
@@ -380,10 +375,6 @@ private:
         std::cerr << "[EMBED] ONNX Runtime not compiled in (AIPR_HAS_ONNX not defined)" << std::endl;
         return false;
 #endif
-    }
-
-    bool initializeSentenceTransformers() {
-        return !config_.model_name.empty();
     }
 
     // ── HTTP backend (production — libcurl + OpenAI-compatible API) ──
@@ -741,11 +732,6 @@ private:
 #else
         return embedBatchMock(texts);
 #endif
-    }
-
-    std::vector<std::vector<float>> embedBatchSentenceTransformers(const std::vector<std::string>& texts) {
-        // TODO: implement Python bridge
-        return embedBatchMock(texts);
     }
 
     std::vector<std::vector<float>> embedBatchMock(const std::vector<std::string>& texts) {

@@ -19,6 +19,17 @@ const azureDevOpsAPIBase = "https://dev.azure.com"
 // apiVersion is appended to all Azure DevOps REST API calls.
 const apiVersion = "7.1"
 
+func init() {
+	vcs.RegisterFactory(vcs.PlatformAzureDevOps, func(creds *vcs.ResolvedCreds) vcs.Platform {
+		return New(Config{
+			PAT:           creds.Token,
+			Organization:  creds.Organization,
+			WebhookSecret: creds.WebhookSecret,
+			BaseURL:       creds.BaseURL,
+		})
+	})
+}
+
 // Config holds Azure DevOps specific configuration.
 type Config struct {
 	// PAT (Personal Access Token) — used with Basic auth (username is empty).
@@ -451,4 +462,181 @@ func (c *Client) doJSON(ctx context.Context, method, url string, body interface{
 		}
 	}
 	return nil
+}
+
+// ── Branch / Commit / PR Creation ───────────────────────────────────────────
+
+// CreateBranch creates a new branch from the given commit SHA.
+// Azure DevOps uses the refs endpoint to create git refs.
+func (c *Client) CreateBranch(ctx context.Context, project, repo string, req *vcs.CreateBranchRequest) error {
+	url := c.apiURL(project, repo, "refs")
+
+	// Azure DevOps creates branches by posting a ref update with
+	// oldObjectId=0000... (does not exist yet) and newObjectId=<sha>.
+	body := []map[string]interface{}{
+		{
+			"name":        "refs/heads/" + req.BranchName,
+			"oldObjectId": "0000000000000000000000000000000000000000",
+			"newObjectId": req.FromSHA,
+		},
+	}
+
+	var result struct {
+		Value []struct {
+			Success bool   `json:"success"`
+			Name    string `json:"name"`
+		} `json:"value"`
+	}
+	if err := c.doJSON(ctx, http.MethodPost, url, body, &result); err != nil {
+		return fmt.Errorf("create branch %s: %w", req.BranchName, err)
+	}
+
+	if len(result.Value) > 0 && !result.Value[0].Success {
+		return fmt.Errorf("create branch %s: ref update failed", req.BranchName)
+	}
+
+	slog.Info("azuredevops: created branch", "project", project, "repo", repo, "branch", req.BranchName)
+	return nil
+}
+
+// CreateOrUpdateFile creates or updates a file on a branch and commits it.
+// Azure DevOps uses the "pushes" endpoint to commit file changes.
+func (c *Client) CreateOrUpdateFile(ctx context.Context, project, repo, branch string, file *vcs.FileCommit) (string, error) {
+	// First get the current HEAD of the branch.
+	latestSHA, err := c.GetBranchSHA(ctx, project, repo, branch)
+	if err != nil {
+		return "", fmt.Errorf("get branch SHA for push: %w", err)
+	}
+
+	// Determine change type: check if file exists to decide add vs edit.
+	changeType := "add"
+	_, getErr := c.GetFileContent(ctx, project, repo, file.Path, branch)
+	if getErr == nil {
+		changeType = "edit"
+	}
+
+	url := c.apiURL(project, repo, "pushes")
+
+	pushBody := map[string]interface{}{
+		"refUpdates": []map[string]string{
+			{
+				"name":        "refs/heads/" + branch,
+				"oldObjectId": latestSHA,
+			},
+		},
+		"commits": []map[string]interface{}{
+			{
+				"comment": file.Message,
+				"changes": []map[string]interface{}{
+					{
+						"changeType": changeType,
+						"item": map[string]string{
+							"path": "/" + file.Path,
+						},
+						"newContent": map[string]string{
+							"content":     file.Content,
+							"contentType": "rawtext",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	var result struct {
+		Commits []struct {
+			CommitID string `json:"commitId"`
+		} `json:"commits"`
+	}
+	if err := c.doJSON(ctx, http.MethodPost, url, pushBody, &result); err != nil {
+		return "", fmt.Errorf("push file %s: %w", file.Path, err)
+	}
+
+	commitSHA := ""
+	if len(result.Commits) > 0 {
+		commitSHA = result.Commits[0].CommitID
+	}
+
+	slog.Info("azuredevops: committed file", "project", project, "repo", repo, "path", file.Path, "sha", commitSHA)
+	return commitSHA, nil
+}
+
+// CreatePullRequest opens a new pull request on Azure DevOps.
+func (c *Client) CreatePullRequest(ctx context.Context, project, repo string, req *vcs.CreatePullRequestRequest) (*vcs.PullRequest, error) {
+	url := c.apiURL(project, repo, "pullrequests")
+
+	body := map[string]interface{}{
+		"sourceRefName": "refs/heads/" + req.SourceBranch,
+		"targetRefName": "refs/heads/" + req.TargetBranch,
+		"title":         req.Title,
+		"description":   req.Body,
+		"isDraft":       req.Draft,
+	}
+
+	var adoPR adoPullRequest
+	if err := c.doJSON(ctx, http.MethodPost, url, body, &adoPR); err != nil {
+		return nil, fmt.Errorf("create PR: %w", err)
+	}
+
+	state := strings.ToLower(adoPR.Status)
+	switch state {
+	case "active":
+		state = "open"
+	case "completed":
+		state = "merged"
+	case "abandoned":
+		state = "closed"
+	}
+
+	pr := &vcs.PullRequest{
+		ID:           fmt.Sprintf("%d", adoPR.PullRequestID),
+		Number:       adoPR.PullRequestID,
+		Title:        adoPR.Title,
+		Description:  adoPR.Description,
+		Author:       adoPR.CreatedBy.UniqueName,
+		SourceBranch: trimRefPrefix(adoPR.SourceRefName),
+		TargetBranch: trimRefPrefix(adoPR.TargetRefName),
+		State:        state,
+		URL:          adoPR.URL,
+		HeadSHA:      adoPR.LastMergeSourceCommit.CommitID,
+		BaseSHA:      adoPR.LastMergeTargetCommit.CommitID,
+		Draft:        adoPR.IsDraft,
+		CreatedAt:    adoPR.CreationDate,
+	}
+
+	slog.Info("azuredevops: created pull request", "project", project, "repo", repo, "id", adoPR.PullRequestID)
+	return pr, nil
+}
+
+// GetDefaultBranch returns the repo's default branch name.
+func (c *Client) GetDefaultBranch(ctx context.Context, project, repo string) (string, error) {
+	// The repository metadata endpoint returns defaultBranch.
+	url := fmt.Sprintf("%s/%s/%s/_apis/git/repositories/%s?api-version=%s",
+		c.baseURL, c.org, project, repo, apiVersion)
+
+	var repoInfo struct {
+		DefaultBranch string `json:"defaultBranch"` // "refs/heads/main"
+	}
+	if err := c.doJSON(ctx, http.MethodGet, url, nil, &repoInfo); err != nil {
+		return "", fmt.Errorf("get default branch: %w", err)
+	}
+	return trimRefPrefix(repoInfo.DefaultBranch), nil
+}
+
+// GetBranchSHA returns the HEAD commit SHA for a branch.
+func (c *Client) GetBranchSHA(ctx context.Context, project, repo, branch string) (string, error) {
+	url := c.apiURL(project, repo, fmt.Sprintf("refs?filter=heads/%s", branch))
+
+	var refs struct {
+		Value []struct {
+			ObjectID string `json:"objectId"`
+		} `json:"value"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, url, nil, &refs); err != nil {
+		return "", fmt.Errorf("get branch SHA: %w", err)
+	}
+	if len(refs.Value) == 0 {
+		return "", fmt.Errorf("branch %s not found", branch)
+	}
+	return refs.Value[0].ObjectID, nil
 }

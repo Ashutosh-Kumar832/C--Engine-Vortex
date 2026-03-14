@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,12 +27,44 @@ const (
 	RoleSystem    Role = "system"
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
+	RoleTool      Role = "tool"
 )
 
 // Message is a single message in a conversation.
 type Message struct {
-	Role    Role   `json:"role"`
-	Content string `json:"content"`
+	Role       Role       `json:"role"`
+	Content    string     `json:"content"`
+	Name       string     `json:"name,omitempty"`         // function name when Role == RoleTool
+	ToolCallID string     `json:"tool_call_id,omitempty"` // correlates tool result to ToolCall.ID
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // set by assistant when requesting tool invocations
+}
+
+// ── Tool Calling Types ──────────────────────────────────────────────────────
+
+// ToolCall represents a single tool invocation requested by the LLM.
+type ToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"` // always "function"
+	Function ToolCallFunc `json:"function"`
+}
+
+// ToolCallFunc is the function name and JSON-encoded arguments string.
+type ToolCallFunc struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// ToolDef describes a tool the LLM may invoke (OpenAI function-calling format).
+type ToolDef struct {
+	Type     string       `json:"type"` // "function"
+	Function ToolFunction `json:"function"`
+}
+
+// ToolFunction is the function schema within a tool definition.
+type ToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
 }
 
 // CompletionRequest is sent to an LLM provider.
@@ -42,14 +75,18 @@ type CompletionRequest struct {
 	Temperature float64   `json:"temperature,omitempty"`
 	TopP        float64   `json:"top_p,omitempty"`
 	Stop        []string  `json:"stop,omitempty"`
+	Tools       []ToolDef `json:"tools,omitempty"`       // tool definitions for function calling
+	ToolChoice  string    `json:"tool_choice,omitempty"` // "auto", "none", "required"
+	AgentRole   string    `json:"agent_role,omitempty"`  // agent role hint for smart routing
 }
 
 // CompletionResponse is the result from an LLM provider.
 type CompletionResponse struct {
-	Content      string `json:"content"`
-	Model        string `json:"model"`
-	FinishReason string `json:"finish_reason"`
-	Usage        Usage  `json:"usage"`
+	Content      string     `json:"content"`
+	Model        string     `json:"model"`
+	FinishReason string     `json:"finish_reason"` // "stop" or "tool_calls"
+	Usage        Usage      `json:"usage"`
+	ToolCalls    []ToolCall `json:"tool_calls,omitempty"` // tool invocations requested by the LLM
 }
 
 // Usage tracks token consumption.
@@ -61,11 +98,12 @@ type Usage struct {
 
 // StreamChunk is a single piece of a streamed completion response.
 type StreamChunk struct {
-	Content      string `json:"content"`                 // incremental text delta
-	Model        string `json:"model,omitempty"`         // only set on first/last chunk
-	FinishReason string `json:"finish_reason,omitempty"` // set when streaming is done (e.g. "stop")
-	Done         bool   `json:"done"`                    // true on the final chunk
-	Usage        *Usage `json:"usage,omitempty"`         // set on the final chunk
+	Content      string     `json:"content"`                 // incremental text delta
+	Model        string     `json:"model,omitempty"`         // only set on first/last chunk
+	FinishReason string     `json:"finish_reason,omitempty"` // set when streaming is done (e.g. "stop")
+	Done         bool       `json:"done"`                    // true on the final chunk
+	Usage        *Usage     `json:"usage,omitempty"`         // set on the final chunk
+	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`    // tool invocations accumulated during stream
 }
 
 // ── Provider Interface ──────────────────────────────────────────────────────
@@ -119,13 +157,20 @@ type SecretStore interface {
 	GetAll() (map[string]string, error)
 }
 
+// ModelRoute maps an agent role to a preferred provider and optional model override.
+type ModelRoute struct {
+	Provider string `json:"provider"`        // provider name, e.g. "anthropic"
+	Model    string `json:"model,omitempty"` // optional model override, e.g. "claude-sonnet-4-20250514"
+}
+
 // Registry manages configured LLM providers with fallback ordering.
 type Registry struct {
 	providers map[string]Provider
 	meta      map[string]ProviderMeta
 	primary   string
 	fallbacks []string
-	vault     SecretStore // optional — if set, API keys are persisted
+	vault     SecretStore           // optional — if set, API keys are persisted
+	routes    map[string]ModelRoute // role → preferred provider/model
 }
 
 // NewRegistry creates an empty LLM provider registry.
@@ -133,7 +178,49 @@ func NewRegistry() *Registry {
 	return &Registry{
 		providers: make(map[string]Provider),
 		meta:      make(map[string]ProviderMeta),
+		routes:    make(map[string]ModelRoute),
 	}
+}
+
+// SetRoutes configures role-based model routing. Each key is an agent role
+// (e.g. "orchestrator", "senior_dev") and the value specifies which provider
+// and optionally which model to use for that role. Routes are persisted to the
+// vault so they survive restarts.
+func (r *Registry) SetRoutes(routes map[string]ModelRoute) {
+	r.routes = routes
+	r.persistRoutes()
+}
+
+// persistRoutes writes the current routes to the vault as a JSON blob.
+func (r *Registry) persistRoutes() {
+	if r.vault == nil || len(r.routes) == 0 {
+		return
+	}
+	data, err := json.Marshal(r.routes)
+	if err != nil {
+		slog.Error("vault: failed to marshal routes", "error", err)
+		return
+	}
+	if err := r.vault.Set("llm.routes", string(data)); err != nil {
+		slog.Error("vault: failed to persist routes", "error", err)
+	} else {
+		slog.Info("vault: agent routes persisted", "count", len(r.routes))
+	}
+}
+
+// SetRoute sets a single role → provider/model mapping and persists to vault.
+func (r *Registry) SetRoute(role string, route ModelRoute) {
+	r.routes[role] = route
+	r.persistRoutes()
+}
+
+// GetRoutes returns the current role-based routing table.
+func (r *Registry) GetRoutes() map[string]ModelRoute {
+	out := make(map[string]ModelRoute, len(r.routes))
+	for k, v := range r.routes {
+		out[k] = v
+	}
+	return out
 }
 
 // SetVault attaches a secret store for persisting API keys across restarts.
@@ -157,9 +244,27 @@ func (r *Registry) RegisterWithMeta(p Provider, m ProviderMeta) {
 	r.meta[p.Name()] = m
 }
 
-// SetPrimary changes the primary provider.
+// SetPrimary changes the primary provider and persists the choice.
 func (r *Registry) SetPrimary(name string) {
 	r.primary = name
+
+	// Remove name from fallbacks and prepend remaining providers.
+	newFallbacks := make([]string, 0, len(r.fallbacks))
+	for _, fb := range r.fallbacks {
+		if fb != name {
+			newFallbacks = append(newFallbacks, fb)
+		}
+	}
+	r.fallbacks = newFallbacks
+
+	// Persist to vault so the choice survives restarts.
+	if r.vault != nil {
+		if err := r.vault.Set("llm.primary", name); err != nil {
+			slog.Error("vault: failed to persist primary provider", "provider", name, "error", err)
+		} else {
+			slog.Info("vault: primary provider persisted", "provider", name)
+		}
+	}
 }
 
 // Get returns a specific provider.
@@ -246,28 +351,58 @@ func (r *Registry) LoadFromVault() int {
 	}
 
 	loaded := 0
-	for vaultKey, apiKey := range secrets {
-		// Keys are stored as "llm.<provider>.api_key".
+	for vaultKey, value := range secrets {
+		// Restore persisted primary provider choice.
+		if vaultKey == "llm.primary" {
+			if _, ok := r.providers[value]; ok {
+				r.primary = value
+				slog.Info("vault: restored primary provider", "provider", value)
+			}
+			continue
+		}
+
+		// Skip non-LLM keys.
 		if len(vaultKey) < 5 || vaultKey[:4] != "llm." {
 			continue
 		}
 		parts := splitVaultKey(vaultKey)
-		if len(parts) != 3 || parts[2] != "api_key" {
+		if len(parts) != 3 {
 			continue
 		}
 		providerName := parts[1]
 
-		// Skip if the provider already has a key (from env var).
-		if m, ok := r.meta[providerName]; ok && m.Configured && m.APIKey != "" {
-			slog.Debug("vault: skipping — env var already set", "provider", providerName)
-			continue
-		}
+		switch parts[2] {
+		case "api_key":
+			// Skip if the provider already has a key (from env var).
+			if m, ok := r.meta[providerName]; ok && m.Configured && m.APIKey != "" {
+				slog.Debug("vault: skipping — env var already set", "provider", providerName)
+				continue
+			}
+			if value != "" {
+				// Apply without re-persisting (avoid write loop).
+				r.updateAPIKeyInternal(providerName, value)
+				slog.Info("vault: loaded API key for provider", "provider", providerName)
+				loaded++
+			}
 
-		if apiKey != "" {
-			// Apply without re-persisting (avoid write loop).
-			r.updateAPIKeyInternal(providerName, apiKey)
-			slog.Info("vault: loaded API key for provider", "provider", providerName)
-			loaded++
+		case "model":
+			// Restore user's model choice (UI-configured overrides code defaults).
+			if value != "" {
+				if m, ok := r.meta[providerName]; ok {
+					m.DefaultModel = value
+					r.meta[providerName] = m
+					slog.Info("vault: restored model choice", "provider", providerName, "model", value)
+				}
+			}
+		}
+	}
+
+	// Load persisted routes (UI-configured overrides XML defaults).
+	if routeJSON, err := r.vault.Get("llm.routes"); err == nil && routeJSON != "" {
+		var vaultRoutes map[string]ModelRoute
+		if err := json.Unmarshal([]byte(routeJSON), &vaultRoutes); err == nil && len(vaultRoutes) > 0 {
+			r.routes = vaultRoutes
+			slog.Info("vault: restored agent routes", "count", len(vaultRoutes))
 		}
 	}
 
@@ -326,7 +461,8 @@ func splitVaultKey(key string) []string {
 	return parts
 }
 
-// UpdateModel updates the default model for a provider at runtime.
+// UpdateModel updates the default model for a provider at runtime and persists
+// the choice to vault so it survives restarts.
 func (r *Registry) UpdateModel(name, model string) bool {
 	m, ok := r.meta[name]
 	if !ok {
@@ -334,6 +470,16 @@ func (r *Registry) UpdateModel(name, model string) bool {
 	}
 	m.DefaultModel = model
 	r.meta[name] = m
+
+	// Persist to vault.
+	if r.vault != nil && model != "" {
+		vaultKey := fmt.Sprintf("llm.%s.model", name)
+		if err := r.vault.Set(vaultKey, model); err != nil {
+			slog.Error("vault: failed to persist model choice", "provider", name, "error", err)
+		} else {
+			slog.Info("vault: model choice persisted", "provider", name, "model", model)
+		}
+	}
 	return true
 }
 
@@ -370,34 +516,134 @@ func (r *Registry) PrimaryName() string {
 	return r.primary
 }
 
-// Complete tries the primary provider, then falls back on error.
+// Complete tries the best provider for the request (role-based routing),
+// then falls back on error or truncation.
+//
+// Routing priority:
+//  1. If the request specifies AgentRole and a route exists → use that provider.
+//  2. Otherwise use the primary provider.
+//  3. On error or truncated response (finish_reason == "length") → try next provider.
 func (r *Registry) Complete(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error) {
-	// Try primary first.
-	if p, ok := r.providers[r.primary]; ok {
-		resp, err := p.Complete(ctx, req)
-		if err == nil {
-			return resp, nil
+	order := r.routeOrder(req)
+	var lastErr error
+
+	for attempt, entry := range order {
+		p, ok := r.providers[entry.provider]
+		if !ok {
+			continue
 		}
-		// Log and try fallbacks.
+
+		// Check that this provider is configured (has an API key or doesn't need one).
+		if m, mOK := r.meta[entry.provider]; mOK && m.RequiresKey && !m.Configured {
+			slog.Debug("llm: skipping unconfigured provider", "provider", entry.provider)
+			continue
+		}
+
+		// Apply model override for this route if the request didn't specify one.
+		routeReq := *req
+		if entry.model != "" && routeReq.Model == "" {
+			routeReq.Model = entry.model
+		}
+
+		resp, err := p.Complete(ctx, &routeReq)
+		if err != nil {
+			lastErr = err
+			slog.Warn("llm: provider failed, trying next",
+				"provider", entry.provider, "attempt", attempt+1, "error", err)
+			continue
+		}
+
+		// Check for truncated response — finish_reason == "length" means the
+		// model hit its output token limit before completing the answer.
+		if resp.FinishReason == "length" && attempt < len(order)-1 {
+			slog.Warn("llm: response truncated (finish_reason=length), retrying with next provider",
+				"provider", entry.provider, "model", resp.Model,
+				"completion_tokens", resp.Usage.CompletionTokens)
+			// Only retry if the next provider is different.
+			lastErr = fmt.Errorf("response truncated by %s/%s", entry.provider, resp.Model)
+			continue
+		}
+
+		return resp, nil
 	}
 
-	for _, name := range r.fallbacks {
-		p := r.providers[name]
-		resp, err := p.Complete(ctx, req)
-		if err == nil {
-			return resp, nil
-		}
+	if lastErr != nil {
+		return nil, fmt.Errorf("all providers failed: %w", lastErr)
 	}
-
 	return nil, ErrProviderNotFound
 }
 
-// ListProviders returns the names of all registered providers.
-func (r *Registry) ListProviders() []string {
-	names := make([]string, 0, len(r.providers))
-	for name := range r.providers {
-		names = append(names, name)
+// routeEntry is a provider + optional model override in the routing order.
+type routeEntry struct {
+	provider string
+	model    string
+}
+
+// routeOrder determines the provider try-order for a request.
+// If a role-based route is configured, that provider goes first, then the
+// normal primary+fallbacks order (skipping duplicates).
+func (r *Registry) routeOrder(req *CompletionRequest) []routeEntry {
+	entries := make([]routeEntry, 0, len(r.providers))
+	seen := make(map[string]bool, len(r.providers))
+
+	// 1. If there's a role-based route, try that provider first.
+	if req.AgentRole != "" {
+		if route, ok := r.routes[req.AgentRole]; ok {
+			if _, provOK := r.providers[route.Provider]; provOK {
+				entries = append(entries, routeEntry{provider: route.Provider, model: route.Model})
+				seen[route.Provider] = true
+				slog.Debug("llm: role-based routing",
+					"role", req.AgentRole, "provider", route.Provider, "model", route.Model)
+			}
+		}
 	}
+
+	// 2. Primary (if not already added by role routing).
+	if r.primary != "" && !seen[r.primary] {
+		entries = append(entries, routeEntry{provider: r.primary})
+		seen[r.primary] = true
+	}
+
+	// 3. Fallbacks in order.
+	for _, fb := range r.fallbacks {
+		if !seen[fb] {
+			entries = append(entries, routeEntry{provider: fb})
+			seen[fb] = true
+		}
+	}
+
+	return entries
+}
+
+// ListProviders returns the names of all registered providers in stable order
+// (primary first, then fallbacks, then any remaining).
+func (r *Registry) ListProviders() []string {
+	seen := make(map[string]bool, len(r.providers))
+	names := make([]string, 0, len(r.providers))
+
+	// Primary first.
+	if r.primary != "" {
+		if _, ok := r.providers[r.primary]; ok {
+			names = append(names, r.primary)
+			seen[r.primary] = true
+		}
+	}
+
+	// Then fallbacks in order.
+	for _, fb := range r.fallbacks {
+		if !seen[fb] {
+			names = append(names, fb)
+			seen[fb] = true
+		}
+	}
+
+	// Then any remaining (shouldn't happen, but be safe).
+	for name := range r.providers {
+		if !seen[name] {
+			names = append(names, name)
+		}
+	}
+
 	return names
 }
 

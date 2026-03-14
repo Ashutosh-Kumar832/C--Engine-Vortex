@@ -57,7 +57,7 @@ type Handler struct {
 	OAuthReg     *auth.ProviderRegistry
 	TokenEnc     *rtcrypto.TokenEncryptor
 	LLMRegistry  *llm.Registry
-	VCSRegistry  *vcs.PlatformRegistry
+	VCSResolver  *vcs.Resolver
 	EngineClient *engine.Client
 
 	ReviewPipeline   *review.Pipeline
@@ -351,6 +351,27 @@ func (h *Handler) RefreshToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to generate tokens")
 		return
 	}
+
+	// Set refreshed tokens in cookies so the browser picks them up
+	// automatically — mirrors the cookie-setting logic in OAuthCallback.
+	http.SetCookie(w, &http.Cookie{
+		Name:     "access_token",
+		Value:    tokenPair.AccessToken,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(tokenPair.ExpiresIn),
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     "refresh_token",
+		Value:    tokenPair.RefreshToken,
+		Path:     "/api/v1/auth/refresh",
+		HttpOnly: true,
+		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   7 * 24 * 60 * 60, // 7 days
+	})
 
 	writeJSON(w, http.StatusOK, tokenPair)
 }
@@ -1123,21 +1144,26 @@ func (h *Handler) ListBranches(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Run git ls-remote --heads to list remote branches
-	var gitCmd string
-	if cloneToken != "" && strings.HasPrefix(repo.CloneURL, "https://") {
-		gitCmd = fmt.Sprintf("git -c http.extraHeader='Authorization: Bearer %s' ls-remote --heads %s",
-			cloneToken, repo.CloneURL)
-	} else {
-		gitCmd = fmt.Sprintf("git ls-remote --heads %s", repo.CloneURL)
-	}
+	// Run git ls-remote --heads to list remote branches.
+	// Try unauthenticated first (works for public repos), fall back to token.
+	gitCmd := fmt.Sprintf("git ls-remote --heads %s", repo.CloneURL)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	// Execute git ls-remote
 	cmd := exec.CommandContext(ctx, "sh", "-c", gitCmd)
 	output, err := cmd.Output()
+
+	if err != nil && cloneToken != "" && strings.HasPrefix(repo.CloneURL, "https://") {
+		// Unauthenticated failed — retry with token (private repo)
+		slog.Info("unauthenticated ls-remote failed, retrying with VCS token",
+			"repo_id", repoID)
+		gitCmd = fmt.Sprintf("git -c http.extraHeader='Authorization: Bearer %s' ls-remote --heads %s",
+			cloneToken, repo.CloneURL)
+		cmd = exec.CommandContext(ctx, "sh", "-c", gitCmd)
+		output, err = cmd.Output()
+	}
+
 	if err != nil {
 		slog.Error("failed to list branches", "repo_id", repoID, "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to list remote branches")
@@ -1404,6 +1430,7 @@ func (h *Handler) ListLLMProviders(w http.ResponseWriter, r *http.Request) {
 		"providers": providers,
 		"primary":   h.LLMRegistry.PrimaryName(),
 		"count":     len(providers),
+		"routes":    h.LLMRegistry.GetRoutes(),
 	})
 }
 
@@ -1474,6 +1501,70 @@ func (h *Handler) SetPrimaryLLMProvider(w http.ResponseWriter, r *http.Request) 
 	h.LLMRegistry.SetPrimary(req.Provider)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"primary": req.Provider,
+	})
+}
+
+// GetLLMRoutes returns the role-based model routing table.
+// GET /api/v1/llm/routes
+func (h *Handler) GetLLMRoutes(w http.ResponseWriter, _ *http.Request) {
+	routes := h.LLMRegistry.GetRoutes()
+
+	type routeInfo struct {
+		Role     string `json:"role"`
+		Provider string `json:"provider"`
+		Model    string `json:"model,omitempty"`
+	}
+
+	out := make([]routeInfo, 0, len(routes))
+	for role, route := range routes {
+		out = append(out, routeInfo{
+			Role:     role,
+			Provider: route.Provider,
+			Model:    route.Model,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"routes":  out,
+		"primary": h.LLMRegistry.PrimaryName(),
+	})
+}
+
+// SetLLMRoutes updates the role-based model routing table.
+// PUT /api/v1/llm/routes
+//
+//	Request body:
+//	  { "routes": [{ "role": "orchestrator", "provider": "anthropic", "model": "..." }, ...] }
+func (h *Handler) SetLLMRoutes(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Routes []struct {
+			Role     string `json:"role"`
+			Provider string `json:"provider"`
+			Model    string `json:"model"`
+		} `json:"routes"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	routes := make(map[string]llm.ModelRoute, len(req.Routes))
+	for _, rt := range req.Routes {
+		if rt.Role == "" || rt.Provider == "" {
+			continue
+		}
+		// Verify the provider exists.
+		if _, ok := h.LLMRegistry.Get(rt.Provider); !ok {
+			writeError(w, http.StatusBadRequest, "unknown provider: "+rt.Provider)
+			return
+		}
+		routes[rt.Role] = llm.ModelRoute{Provider: rt.Provider, Model: rt.Model}
+	}
+
+	h.LLMRegistry.SetRoutes(routes)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"routes": len(routes),
+		"ok":     true,
 	})
 }
 
@@ -2119,7 +2210,7 @@ func (h *Handler) GetSystemStats(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"engine": engineDiag, "llm_providers": h.LLMRegistry.ListProviders(),
-		"vcs_platforms": h.VCSRegistry.List(),
+		"vcs_platforms": []string{"github", "gitlab", "bitbucket", "azure_devops"},
 	})
 }
 
@@ -2149,6 +2240,10 @@ func (h *Handler) GetDetailedHealth(w http.ResponseWriter, r *http.Request) {
 
 // HandleGitHubWebhook processes incoming GitHub webhook events.
 // POST /api/v1/webhooks/github
+//
+// Webhook signature validation uses the per-repo webhook secret stored in the
+// repositories table.  The repo is identified from the payload before
+// validation so that each repo can have its own secret.
 func (h *Handler) HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	body, err := io.ReadAll(io.LimitReader(r.Body, 5<<20))
@@ -2159,16 +2254,6 @@ func (h *Handler) HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	evt := &model.WebhookEvent{Platform: "github", EventType: r.Header.Get("X-GitHub-Event"), Payload: body}
 	_ = h.WebhookRepo.RecordEvent(ctx, evt)
 
-	signature := r.Header.Get("X-Hub-Signature-256")
-	ghPlatform, ok := h.VCSRegistry.Get(vcs.PlatformGitHub)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "GitHub platform not configured")
-		return
-	}
-	if !ghPlatform.ValidateWebhookSignature(body, signature) {
-		writeError(w, http.StatusUnauthorized, "invalid webhook signature")
-		return
-	}
 	event := r.Header.Get("X-GitHub-Event")
 	if event != "pull_request" {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "event": event})
@@ -2179,10 +2264,8 @@ func (h *Handler) HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "failed to parse payload")
 		return
 	}
-	if payload.Action != "opened" && payload.Action != "synchronize" {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "action": payload.Action})
-		return
-	}
+
+	// Look up the repo to get its per-repo webhook secret.
 	repo, err := h.RepoRepo.GetByPlatformAndExternalID(ctx, "github", fmt.Sprintf("%d", payload.Repository.ID))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -2190,6 +2273,23 @@ func (h *Handler) HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+
+	// Validate signature using the per-repo webhook secret.
+	signature := r.Header.Get("X-Hub-Signature-256")
+	whSecret := repo.WebhookSecret
+	if whSecret == "" {
+		// Fallback: try the org owner's vault webhook secret.
+		whSecret = h.VCSResolver.ResolveWebhookSecretForOrg(ctx, repo.OrgID, vcs.PlatformGitHub)
+	}
+	if !vcs.ValidateWebhookHMAC(body, signature, whSecret) {
+		writeError(w, http.StatusUnauthorized, "invalid webhook signature")
+		return
+	}
+
+	if payload.Action != "opened" && payload.Action != "synchronize" {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "action": payload.Action})
 		return
 	}
 	go func() {
@@ -2231,16 +2331,6 @@ func (h *Handler) HandleGitLabWebhook(w http.ResponseWriter, r *http.Request) {
 	evt := &model.WebhookEvent{Platform: "gitlab", EventType: r.Header.Get("X-Gitlab-Event"), Payload: body}
 	_ = h.WebhookRepo.RecordEvent(ctx, evt)
 
-	token := r.Header.Get("X-Gitlab-Token")
-	glPlatform, ok := h.VCSRegistry.Get(vcs.PlatformGitLab)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "GitLab platform not configured")
-		return
-	}
-	if !glPlatform.ValidateWebhookSignature(body, token) {
-		writeError(w, http.StatusUnauthorized, "invalid webhook token")
-		return
-	}
 	eventType := r.Header.Get("X-Gitlab-Event")
 	if eventType != "Merge Request Hook" {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "event": eventType})
@@ -2251,10 +2341,8 @@ func (h *Handler) HandleGitLabWebhook(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "failed to parse payload")
 		return
 	}
-	if payload.ObjectAttributes.Action != "open" && payload.ObjectAttributes.Action != "update" {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "action": payload.ObjectAttributes.Action})
-		return
-	}
+
+	// Look up the repo to get its per-repo webhook secret.
 	repo, err := h.RepoRepo.GetByPlatformAndExternalID(ctx, "gitlab", fmt.Sprintf("%d", payload.Project.ID))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -2262,6 +2350,22 @@ func (h *Handler) HandleGitLabWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+
+	// Validate token using per-repo or org-owner webhook secret.
+	token := r.Header.Get("X-Gitlab-Token")
+	whSecret := repo.WebhookSecret
+	if whSecret == "" {
+		whSecret = h.VCSResolver.ResolveWebhookSecretForOrg(ctx, repo.OrgID, vcs.PlatformGitLab)
+	}
+	if !vcs.ValidateWebhookToken(token, whSecret) {
+		writeError(w, http.StatusUnauthorized, "invalid webhook token")
+		return
+	}
+
+	if payload.ObjectAttributes.Action != "open" && payload.ObjectAttributes.Action != "update" {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "action": payload.ObjectAttributes.Action})
 		return
 	}
 	go func() {
@@ -2308,6 +2412,18 @@ func (h *Handler) HandleBitbucketWebhook(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
+
+	// Validate HMAC signature using per-repo webhook secret.
+	signature := r.Header.Get("X-Hub-Signature")
+	whSecret := repo.WebhookSecret
+	if whSecret == "" {
+		whSecret = h.VCSResolver.ResolveWebhookSecretForOrg(ctx, repo.OrgID, vcs.PlatformBitbucket)
+	}
+	if !vcs.ValidateWebhookHMAC(body, signature, whSecret) {
+		writeError(w, http.StatusUnauthorized, "invalid webhook signature")
+		return
+	}
+
 	go func() {
 		reviewCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
@@ -2351,6 +2467,18 @@ func (h *Handler) HandleAzureDevOpsWebhook(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
+
+	// Validate token using per-repo webhook secret.
+	token := r.Header.Get("X-Vss-Token")
+	whSecret := repo.WebhookSecret
+	if whSecret == "" {
+		whSecret = h.VCSResolver.ResolveWebhookSecretForOrg(ctx, repo.OrgID, vcs.PlatformAzureDevOps)
+	}
+	if !vcs.ValidateWebhookToken(token, whSecret) {
+		writeError(w, http.StatusUnauthorized, "invalid webhook token")
+		return
+	}
+
 	go func() {
 		reviewCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()

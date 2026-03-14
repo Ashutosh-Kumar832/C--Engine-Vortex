@@ -1,0 +1,535 @@
+name: Release
+
+# Runs on:
+# - Merge to main: Auto-bump version, create tag, build release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  GO_VERSION: "1.24"
+  CMAKE_VERSION: "3.28.1"
+  MONO_DIR: "mono"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/rtvortex-server
+
+jobs:
+  # ===========================================================================
+  # Version Bump & Tag
+  # ===========================================================================
+  version:
+    name: Bump Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      
+      - name: Bump Version
+        id: version
+        run: |
+          # Read current version
+          VERSION_FILE="${{ env.MONO_DIR }}/VERSION"
+          if [ ! -f "$VERSION_FILE" ]; then
+            echo "1.0.0" > "$VERSION_FILE"
+          fi
+          
+          CURRENT_VERSION=$(cat "$VERSION_FILE" | tr -d '[:space:]')
+          echo "Current version: $CURRENT_VERSION"
+          
+          # Parse version components
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+          
+          # Increment patch version
+          PATCH=$((PATCH + 1))
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          
+          echo "New version: $NEW_VERSION"
+          echo "$NEW_VERSION" > "$VERSION_FILE"
+          
+          # Commit and tag
+          git add "$VERSION_FILE"
+          git commit -m "chore: bump version to $NEW_VERSION [skip ci]"
+          git tag -a "v$NEW_VERSION" -m "Release v$NEW_VERSION"
+          
+          # Push changes
+          git push origin main --follow-tags
+          
+          # Set outputs
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
+
+  # ===========================================================================
+  # Build Engine for All Platforms
+  # ===========================================================================
+  # Build Engine for All Platforms (gRPC Server)
+  # ===========================================================================
+  build-engine:
+    name: Build Engine (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-latest
+          - target: linux-arm64
+            os: ubuntu-latest
+          - target: darwin-x64
+            os: macos-latest
+          - target: darwin-arm64
+            os: macos-14
+          - target: windows-x64
+            os: windows-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
+
+      - name: Cache vcpkg packages (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\vcpkg\installed
+            C:\vcpkg\packages
+          key: vcpkg-windows-x64-release-${{ hashFiles('.github/workflows/release.yml') }}
+          restore-keys: |
+            vcpkg-windows-x64-release-
+            vcpkg-windows-x64-
+
+      - name: Cache FAISS build (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: C:\faiss-install
+          key: faiss-windows-x64-v1.7.4
+          restore-keys: |
+            faiss-windows-x64-v1.7.4
+      
+      - name: Install Dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libomp-dev libopenblas-dev liblapack-dev libgflags-dev
+
+      - name: Build FAISS from source (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          # Check if FAISS is already installed
+          if ldconfig -p | grep -q libfaiss; then
+            echo "FAISS already installed, skipping build"
+            exit 0
+          fi
+          
+          git clone --depth 1 --branch v1.7.4 https://github.com/facebookresearch/faiss.git /tmp/faiss
+          cd /tmp/faiss
+          mkdir build && cd build
+          cmake .. \
+            -DFAISS_ENABLE_GPU=OFF \
+            -DFAISS_ENABLE_PYTHON=OFF \
+            -DFAISS_ENABLE_C_API=ON \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBLA_VENDOR=OpenBLAS
+          cmake --build . --config Release --parallel 4
+          sudo cmake --install . --config Release
+          sudo ldconfig
+      
+      - name: Install Dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libomp openblas faiss protobuf grpc abseil
+          echo "OpenBLAS_HOME=$(brew --prefix openblas)" >> $GITHUB_ENV
+          echo "OpenMP_ROOT=$(brew --prefix libomp)" >> $GITHUB_ENV
+          # Set CMAKE_PREFIX_PATH so CMake can find brew packages
+          echo "CMAKE_PREFIX_PATH=$(brew --prefix)/lib/cmake:$(brew --prefix grpc)/lib/cmake:$(brew --prefix protobuf)/lib/cmake:$(brew --prefix abseil)/lib/cmake" >> $GITHUB_ENV
+      
+      - name: Install Dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # Free up disk space before building gRPC (requires ~10GB)
+          Write-Host "Freeing up disk space..."
+          
+          # Remove unnecessary tools
+          if (Test-Path "C:\Program Files (x86)\Microsoft SDKs\Azure") {
+            Remove-Item -Recurse -Force "C:\Program Files (x86)\Microsoft SDKs\Azure" -ErrorAction SilentlyContinue
+          }
+          if (Test-Path "C:\Program Files\dotnet\sdk") {
+            # Keep only latest .NET SDK
+            Get-ChildItem "C:\Program Files\dotnet\sdk" | Sort-Object Name | Select-Object -SkipLast 1 | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          
+          # Clean vcpkg buildtrees after each package (reduces disk usage)
+          $env:VCPKG_MAX_CONCURRENCY = "2"
+          
+          # Install with reduced parallelism to save memory/disk
+          vcpkg install curl:x64-windows openblas:x64-windows --clean-after-build
+          vcpkg install grpc:x64-windows protobuf:x64-windows --clean-after-build
+        env:
+          VCPKG_DEFAULT_TRIPLET: x64-windows
+
+      - name: Build FAISS from source (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Check if FAISS is already installed (from cache)
+          if (Test-Path "C:\faiss-install\lib\faiss.lib") {
+            Write-Host "FAISS already installed, skipping build"
+            exit 0
+          }
+          
+          git clone --depth 1 --branch v1.7.4 https://github.com/facebookresearch/faiss.git C:\faiss
+          cd C:\faiss
+          mkdir build
+          cd build
+          cmake .. `
+            -DFAISS_ENABLE_GPU=OFF `
+            -DFAISS_ENABLE_PYTHON=OFF `
+            -DFAISS_ENABLE_C_API=ON `
+            -DBUILD_TESTING=OFF `
+            -DBUILD_SHARED_LIBS=ON `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          cmake --build . --config Release --parallel 4
+          cmake --install . --config Release --prefix C:\faiss-install
+      
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: ${{ env.CMAKE_VERSION }}
+      
+      - name: Configure (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          # Pass CMAKE_PREFIX_PATH if set (for macOS brew packages)
+          CMAKE_EXTRA_ARGS=""
+          if [ -n "$CMAKE_PREFIX_PATH" ]; then
+            CMAKE_EXTRA_ARGS="-DCMAKE_PREFIX_PATH=$CMAKE_PREFIX_PATH"
+          fi
+          
+          cmake -B build -S ${{ env.MONO_DIR }}/engine \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAIPR_BUILD_TESTS=OFF \
+            -DAIPR_BUILD_SERVER=ON \
+            -DAIPR_USE_FAISS=ON \
+            -DAIPR_USE_TREE_SITTER=ON \
+            $CMAKE_EXTRA_ARGS
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -B build -S ${{ env.MONO_DIR }}/engine `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DAIPR_BUILD_TESTS=OFF `
+            -DAIPR_BUILD_SERVER=ON `
+            -DAIPR_USE_FAISS=ON `
+            -DAIPR_USE_TREE_SITTER=ON `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DCMAKE_PREFIX_PATH="C:\faiss-install"
+      
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+      
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist/bin dist/lib
+          
+          # Copy engine executable
+          cp build/bin/rtvortex dist/bin/ 2>/dev/null || true
+          cp build/bin/Release/rtvortex.exe dist/bin/ 2>/dev/null || true
+          cp build/bin/rtvortex.exe dist/bin/ 2>/dev/null || true
+          
+          # Copy libraries
+          cp build/lib* dist/lib/ 2>/dev/null || true
+          cp build/*.dll dist/lib/ 2>/dev/null || true
+          cp build/*.dylib dist/lib/ 2>/dev/null || true
+          cp build/*.so dist/lib/ 2>/dev/null || true
+          cp build/Release/*.dll dist/lib/ 2>/dev/null || true
+          
+          tar -czvf rtvortex-engine-${{ matrix.target }}.tar.gz -C dist .
+      
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-${{ matrix.target }}
+          path: rtvortex-engine-${{ matrix.target }}.tar.gz
+
+  # ===========================================================================
+  # Build Go Server for All Platforms
+  # ===========================================================================
+  build-server:
+    name: Build Server (${{ matrix.goos }}-${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            artifact: rtvortex-server-linux-x64
+          - goos: linux
+            goarch: arm64
+            artifact: rtvortex-server-linux-arm64
+          - goos: darwin
+            goarch: amd64
+            artifact: rtvortex-server-darwin-x64
+          - goos: darwin
+            goarch: arm64
+            artifact: rtvortex-server-darwin-arm64
+          - goos: windows
+            goarch: amd64
+            artifact: rtvortex-server-windows-x64
+            ext: .exe
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: ${{ env.MONO_DIR }}/server-go/go.sum
+
+      - name: Build
+        working-directory: ${{ env.MONO_DIR }}/server-go
+        run: |
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath \
+            -ldflags "-s -w \
+              -X main.version=${{ needs.version.outputs.version }} \
+              -X main.commit=${{ github.sha }} \
+              -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o ../../dist/RTVortexGo${{ matrix.ext || '' }} \
+            ./cmd/rtvortex-server/
+
+      - name: Package
+        run: |
+          mkdir -p dist/db/sql dist/db/migrations dist/config
+          cp ${{ env.MONO_DIR }}/server-go/db/sql/*.sql dist/db/sql/ 2>/dev/null || true
+          cp ${{ env.MONO_DIR }}/server-go/db/migrations/*.sql dist/db/migrations/ 2>/dev/null || true
+          cp -r ${{ env.MONO_DIR }}/config/* dist/config/ 2>/dev/null || true
+          tar -czvf ${{ matrix.artifact }}.tar.gz -C dist .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+  # ===========================================================================
+  # Build Docker Image
+  # ===========================================================================
+  build-docker:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [version, build-server]
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.MONO_DIR }}
+          file: ${{ env.MONO_DIR }}/deploy/docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ needs.version.outputs.version }}
+            COMMIT=${{ github.sha }}
+
+  # ===========================================================================
+  # Create GitHub Release
+  # ===========================================================================
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [version, build-engine, build-server, build-docker]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Prepare Release Assets
+        run: |
+          mkdir -p release-assets
+
+          # Copy engine artifacts
+          for dir in artifacts/engine-*; do
+            cp "$dir"/*.tar.gz release-assets/ 2>/dev/null || true
+          done
+
+          # Copy server artifacts
+          for dir in artifacts/rtvortex-server-*; do
+            cp "$dir"/*.tar.gz release-assets/ 2>/dev/null || true
+          done
+
+      - name: Generate Release Notes
+        run: |
+          cat > release-notes.md << 'EOF'
+          ## RTVortex v${{ needs.version.outputs.version }}
+
+          ### Downloads
+
+          #### Go API Server
+          | Package | Platform |
+          |---------|----------|
+          | `rtvortex-server-linux-x64.tar.gz` | Linux x64 |
+          | `rtvortex-server-linux-arm64.tar.gz` | Linux ARM64 |
+          | `rtvortex-server-darwin-x64.tar.gz` | macOS x64 |
+          | `rtvortex-server-darwin-arm64.tar.gz` | macOS ARM64 (Apple Silicon) |
+          | `rtvortex-server-windows-x64.tar.gz` | Windows x64 |
+
+          #### C++ Engine (gRPC)
+          | Package | Platform |
+          |---------|----------|
+          | `rtvortex-engine-linux-x64.tar.gz` | Linux x64 |
+          | `rtvortex-engine-linux-arm64.tar.gz` | Linux ARM64 |
+          | `rtvortex-engine-darwin-x64.tar.gz` | macOS x64 |
+          | `rtvortex-engine-darwin-arm64.tar.gz` | macOS ARM64 |
+          | `rtvortex-engine-windows-x64.tar.gz` | Windows x64 |
+
+          ### Docker
+
+          ```bash
+          docker pull ghcr.io/${{ github.repository_owner }}/rtvortex-server:${{ needs.version.outputs.version }}
+          docker pull ghcr.io/${{ github.repository_owner }}/rtvortex-server:latest
+          ```
+
+          ### Quick Start
+
+          ```bash
+          # Extract the server binary
+          tar -xzf rtvortex-server-linux-x64.tar.gz
+
+          # Start the C++ engine (gRPC server on port 50051)
+          ./bin/rtvortex --port 50051 &
+
+          # Start the Go API server
+          export DATABASE_HOST=localhost DATABASE_NAME=rtvortex
+          export ENGINE_HOST=localhost ENGINE_PORT=50051
+          ./RTVortexGo
+          ```
+
+          ### Docker Compose
+
+          ```bash
+          cd mono/deploy/docker
+          export LLM_API_KEY=your_key
+          docker compose up -d
+          ```
+
+          See [setup guide](docs/setup.md) and [architecture](docs/architecture.md) for details.
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: Release v${{ needs.version.outputs.version }}
+          body_path: release-notes.md
+          files: release-assets/*
+          draft: false
+          prerelease: false
+
+  # ===========================================================================
+  # Cleanup Old Artifacts
+  # ===========================================================================
+  cleanup:
+    name: Cleanup Old Artifacts
+    runs-on: ubuntu-latest
+    needs: [version, release]
+    
+    steps:
+      - name: Delete Old Release Artifacts
+        uses: actions/github-script@v7
+        env:
+          CURRENT_VERSION: ${{ needs.version.outputs.version }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const currentVersion = process.env.CURRENT_VERSION;
+            
+            // Get all artifacts
+            const artifacts = await github.rest.actions.listArtifactsForRepo({
+              owner,
+              repo,
+              per_page: 100
+            });
+            
+            for (const artifact of artifacts.data.artifacts) {
+              // Skip current version artifacts
+              if (artifact.name.includes(currentVersion)) {
+                console.log(`Keeping: ${artifact.name}`);
+                continue;
+              }
+              
+              // Delete old artifacts (older than 30 days)
+              const createdAt = new Date(artifact.created_at);
+              const thirtyDaysAgo = new Date();
+              thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+              
+              if (createdAt < thirtyDaysAgo) {
+                console.log(`Deleting old artifact: ${artifact.name}`);
+                await github.rest.actions.deleteArtifact({
+                  owner,
+                  repo,
+                  artifact_id: artifact.id
+                });
+              }
+            }

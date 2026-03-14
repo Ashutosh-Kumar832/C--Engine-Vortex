@@ -7,6 +7,7 @@
 
 import { getApiBaseUrl } from "@/lib/utils";
 import type {
+  AgentRoute,
   AuthProvider,
   ChatMessage,
   ChatSession,
@@ -192,6 +193,11 @@ async function tryRefreshToken(): Promise<boolean> {
     const data = await res.json();
     if (data.access_token) {
       setAccessToken(data.access_token);
+      // Update the middleware route-protection cookie to match.
+      if (typeof document !== "undefined") {
+        const maxAge = data.expires_in ?? 3600; // default 1 hour
+        document.cookie = `token=${data.access_token}; path=/; max-age=${maxAge}; samesite=lax`;
+      }
     }
     if (data.refresh_token && typeof window !== "undefined") {
       try { localStorage.setItem("rtvortex_refresh_token", data.refresh_token); } catch { /* ignore */ }
@@ -350,7 +356,7 @@ export const reviews = {
 export const llm = {
   providers: async () => {
     const res = await request<{ providers: LLMProvider[]; primary: string; count: number }>("/api/v1/llm/providers");
-    return res.providers ?? [];
+    return { providers: res.providers ?? [], primary: res.primary ?? "" };
   },
 
   configure: (provider: string, data: LLMConfigureRequest) =>
@@ -380,6 +386,17 @@ export const llm = {
   balance: (provider: string) =>
     request<LLMBalanceResult>(`/api/v1/llm/providers/${provider}/balance`, {
       method: "POST",
+    }),
+
+  /** Get the current agent role → provider/model routing table. */
+  routes: () =>
+    request<{ routes: AgentRoute[]; primary: string }>("/api/v1/llm/routes"),
+
+  /** Update the agent role → provider/model routing table. */
+  setRoutes: (routes: AgentRoute[]) =>
+    request<{ routes: number; ok: boolean }>("/api/v1/llm/routes", {
+      method: "PUT",
+      body: JSON.stringify({ routes }),
     }),
 };
 

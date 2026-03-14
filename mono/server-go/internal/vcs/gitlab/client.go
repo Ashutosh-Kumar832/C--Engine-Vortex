@@ -15,6 +15,16 @@ import (
 
 const gitlabAPIBase = "https://gitlab.com/api/v4"
 
+func init() {
+	vcs.RegisterFactory(vcs.PlatformGitLab, func(creds *vcs.ResolvedCreds) vcs.Platform {
+		return New(Config{
+			Token:         creds.Token,
+			WebhookSecret: creds.WebhookSecret,
+			BaseURL:       creds.BaseURL,
+		})
+	})
+}
+
 // Config holds GitLab-specific configuration.
 type Config struct {
 	Token         string
@@ -316,4 +326,133 @@ func (c *Client) doJSON(ctx context.Context, method, url string, body interface{
 		}
 	}
 	return nil
+}
+
+// ── Branch / Commit / PR Creation ───────────────────────────────────────────
+
+// CreateBranch creates a new branch from the given commit SHA.
+func (c *Client) CreateBranch(ctx context.Context, owner, repo string, req *vcs.CreateBranchRequest) error {
+	projectPath := fmt.Sprintf("%s%%2F%s", owner, repo)
+	url := fmt.Sprintf("%s/projects/%s/repository/branches?branch=%s&ref=%s",
+		c.baseURL, projectPath, req.BranchName, req.FromSHA)
+
+	if err := c.doJSON(ctx, http.MethodPost, url, nil, nil); err != nil {
+		return fmt.Errorf("create branch %s: %w", req.BranchName, err)
+	}
+	slog.Info("gitlab: created branch", "project", owner+"/"+repo, "branch", req.BranchName)
+	return nil
+}
+
+// CreateOrUpdateFile creates or updates a file on a branch and commits it.
+// Returns the new commit SHA.
+func (c *Client) CreateOrUpdateFile(ctx context.Context, owner, repo, branch string, file *vcs.FileCommit) (string, error) {
+	projectPath := fmt.Sprintf("%s%%2F%s", owner, repo)
+	encodedPath := strings.ReplaceAll(file.Path, "/", "%2F")
+
+	// Check if the file already exists to decide create vs update.
+	method := http.MethodPost // create
+	checkURL := fmt.Sprintf("%s/projects/%s/repository/files/%s?ref=%s",
+		c.baseURL, projectPath, encodedPath, branch)
+
+	checkReq, _ := http.NewRequestWithContext(ctx, http.MethodHead, checkURL, nil)
+	checkReq.Header.Set("PRIVATE-TOKEN", c.token)
+	if resp, err := c.client.Do(checkReq); err == nil {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			method = http.MethodPut // update
+		}
+	}
+
+	url := fmt.Sprintf("%s/projects/%s/repository/files/%s",
+		c.baseURL, projectPath, encodedPath)
+	body := map[string]interface{}{
+		"branch":         branch,
+		"content":        file.Content,
+		"commit_message": file.Message,
+	}
+
+	var result struct {
+		FilePath string `json:"file_path"`
+	}
+	if err := c.doJSON(ctx, method, url, body, &result); err != nil {
+		return "", fmt.Errorf("create/update file %s: %w", file.Path, err)
+	}
+
+	// Fetch the latest commit SHA on the branch.
+	sha, err := c.GetBranchSHA(ctx, owner, repo, branch)
+	if err != nil {
+		slog.Warn("gitlab: committed file but failed to get SHA", "path", file.Path, "err", err)
+		return "", nil
+	}
+
+	slog.Info("gitlab: committed file", "project", owner+"/"+repo, "path", file.Path, "sha", sha)
+	return sha, nil
+}
+
+// CreatePullRequest opens a new merge request on GitLab.
+func (c *Client) CreatePullRequest(ctx context.Context, owner, repo string, req *vcs.CreatePullRequestRequest) (*vcs.PullRequest, error) {
+	projectPath := fmt.Sprintf("%s%%2F%s", owner, repo)
+	url := fmt.Sprintf("%s/projects/%s/merge_requests", c.baseURL, projectPath)
+
+	body := map[string]interface{}{
+		"source_branch": req.SourceBranch,
+		"target_branch": req.TargetBranch,
+		"title":         req.Title,
+		"description":   req.Body,
+	}
+
+	var glMR glMergeRequest
+	if err := c.doJSON(ctx, http.MethodPost, url, body, &glMR); err != nil {
+		return nil, fmt.Errorf("create MR: %w", err)
+	}
+
+	pr := &vcs.PullRequest{
+		ID:           fmt.Sprintf("%d", glMR.IID),
+		Number:       glMR.IID,
+		Title:        glMR.Title,
+		Description:  glMR.Description,
+		Author:       glMR.Author.Username,
+		SourceBranch: glMR.SourceBranch,
+		TargetBranch: glMR.TargetBranch,
+		State:        glMR.State,
+		URL:          glMR.WebURL,
+		HeadSHA:      glMR.DiffRefs.HeadSHA,
+		BaseSHA:      glMR.DiffRefs.BaseSHA,
+		Draft:        glMR.Draft,
+		CreatedAt:    glMR.CreatedAt,
+		UpdatedAt:    glMR.UpdatedAt,
+	}
+
+	slog.Info("gitlab: created merge request", "project", owner+"/"+repo, "iid", glMR.IID, "url", glMR.WebURL)
+	return pr, nil
+}
+
+// GetDefaultBranch returns the repo's default branch name.
+func (c *Client) GetDefaultBranch(ctx context.Context, owner, repo string) (string, error) {
+	projectPath := fmt.Sprintf("%s%%2F%s", owner, repo)
+	url := fmt.Sprintf("%s/projects/%s", c.baseURL, projectPath)
+
+	var project struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, url, nil, &project); err != nil {
+		return "", fmt.Errorf("get default branch: %w", err)
+	}
+	return project.DefaultBranch, nil
+}
+
+// GetBranchSHA returns the HEAD commit SHA for a branch.
+func (c *Client) GetBranchSHA(ctx context.Context, owner, repo, branch string) (string, error) {
+	projectPath := fmt.Sprintf("%s%%2F%s", owner, repo)
+	url := fmt.Sprintf("%s/projects/%s/repository/branches/%s", c.baseURL, projectPath, branch)
+
+	var branchInfo struct {
+		Commit struct {
+			ID string `json:"id"`
+		} `json:"commit"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, url, nil, &branchInfo); err != nil {
+		return "", fmt.Errorf("get branch SHA: %w", err)
+	}
+	return branchInfo.Commit.ID, nil
 }
